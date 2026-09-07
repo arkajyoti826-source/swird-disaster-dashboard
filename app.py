@@ -195,23 +195,31 @@ if st.button("Run Simulation"):
                         W_t, I_t = aggregated_sol[i-1, 1], aggregated_sol[i-1, 2]
                         denom = base_zeta * I_t - sigma_base * (1 - base_zeta) * W_t
                         if abs(denom) < 1e-8: denom = 1e-8 
-                        ratio = min(abs(1.0 / denom), 1.0) 
+                        
+                        # Apply dt scaling to prevent exponential explosion in the continuous loop
+                        ratio = min(abs(1.0 / denom), 1.0) * dt
+                        
                         added_resource = current_resource_pool * ratio
                         current_resource_pool += added_resource
+                        
                     boost = (num_relief_centers * added_resource) / max(avg_consumption, 1e-8)
                     cumulative_extra_recovered += boost
 
                 else: 
                     if t <= 1.0:
+                        # Direct gap back-calculation (no dt scaling needed here)
                         gap = total_affected[i] - (aggregated_sol[i, 3] + cumulative_extra_recovered)
                         if gap > 0:
                             added_resource = (gap * max(avg_consumption, 1e-8)) / max(num_relief_centers, 1)
                         boost = (num_relief_centers * added_resource) / max(avg_consumption, 1e-8)
                         cumulative_extra_recovered += boost
                     else:
-                        cumulative_extra_recovered *= 0.45 
+                        # Smooth but rapid continuous decay
+                        cumulative_extra_recovered *= 0.95 
 
                 total_recovered[i] = aggregated_sol[i, 3] + cumulative_extra_recovered
+                
+                # Strict structural cap
                 if total_recovered[i] > total_affected[i]:
                     total_recovered[i] = total_affected[i]
                     cumulative_extra_recovered = max(0, total_recovered[i] - aggregated_sol[i, 3])
