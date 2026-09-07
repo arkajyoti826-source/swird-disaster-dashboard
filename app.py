@@ -28,7 +28,7 @@ base_beta = st.sidebar.slider("Rainfall chance (beta)", 0.1, 1.0, 0.6)
 base_zeta = st.sidebar.slider("Drainage rate (zeta)", 0.1, 1.0, 0.3)
 
 st.sidebar.subheader("Resource Allocation")
-initial_resource = st.sidebar.number_input("Initial total resource sent (kg)", value=500.0)
+initial_resource = st.sidebar.number_input("Initial total resource sent (kg)", value=50000.0) # Increased default so it doesn't instantly deplete
 conv_crit = st.sidebar.radio("Convergence criteria", ("Y", "N"))
 avg_consumption = st.sidebar.number_input("Avg consumption (kg/person)", value=0.2)
 
@@ -182,6 +182,7 @@ if st.button("Run Simulation"):
             total_recovered = aggregated_sol[:, 3].copy()
             total_affected = aggregated_sol[:, 1] + aggregated_sol[:, 2] + aggregated_sol[:, 4]
             sigma_base = 0.508 * base_beta - 0.112 * base_zeta
+            
             current_resource_pool = initial_resource
             cumulative_extra_recovered = 0.0
 
@@ -192,34 +193,47 @@ if st.button("Run Simulation"):
                 
                 if conv_crit == 'Y':
                     if delta_affected > 0:
-                        W_t, I_t = aggregated_sol[i-1, 1], aggregated_sol[i-1, 2]
+                        # Normalize population to compute meaningful fractions
+                        total_pop_t = max(aggregated_sol[i-1].sum(), 1.0)
+                        W_t = aggregated_sol[i-1, 1] / total_pop_t
+                        I_t = aggregated_sol[i-1, 2] / total_pop_t
+                        
                         denom = base_zeta * I_t - sigma_base * (1 - base_zeta) * W_t
                         if abs(denom) < 1e-8: denom = 1e-8 
                         
-                        # Apply dt scaling to prevent exponential explosion in the continuous loop
+                        # Apply DT scaling so the multiplier builds up accurately over time, scaled by distribution capacity N
                         ratio = min(abs(1.0 / denom), 1.0) * dt
+                        cap_factor = num_relief_centers / max(num_nodes, 1) # Distribution bandwidth
                         
-                        added_resource = current_resource_pool * ratio
-                        current_resource_pool += added_resource
+                        added_resource = current_resource_pool * ratio * cap_factor
+                        current_resource_pool += added_resource # Continuous replenishment
                         
                     boost = (num_relief_centers * added_resource) / max(avg_consumption, 1e-8)
                     cumulative_extra_recovered += boost
 
                 else: 
+                    # Criteria N: Depletion mechanic
                     if t <= 1.0:
-                        # Direct gap back-calculation (no dt scaling needed here)
                         gap = total_affected[i] - (aggregated_sol[i, 3] + cumulative_extra_recovered)
-                        if gap > 0:
-                            added_resource = (gap * max(avg_consumption, 1e-8)) / max(num_relief_centers, 1)
-                        boost = (num_relief_centers * added_resource) / max(avg_consumption, 1e-8)
-                        cumulative_extra_recovered += boost
+                        if gap > 0 and current_resource_pool > 0:
+                            # Formula: required resource to fulfill the gap
+                            required_resource = (gap * max(avg_consumption, 1e-8)) / max(num_relief_centers, 1)
+                            
+                            # Limit extraction strictly to what is left in the pool
+                            added_resource = min(required_resource, current_resource_pool)
+                            current_resource_pool -= added_resource # Drain the pool
+                            
+                            # Apply the physical boost
+                            boost = (num_relief_centers * added_resource) / max(avg_consumption, 1e-8)
+                            cumulative_extra_recovered += boost
                     else:
-                        # Smooth but rapid continuous decay
-                        cumulative_extra_recovered *= 0.95 
+                        # If time > 1, no new resources allocated, effects exponentially decay and widening the gap
+                        cumulative_extra_recovered *= 0.98 
 
+                # Sum the baseline recovery and the extra resource-induced recovery
                 total_recovered[i] = aggregated_sol[i, 3] + cumulative_extra_recovered
                 
-                # Strict structural cap
+                # Strict structural cap constraint: Recovered <= Affected
                 if total_recovered[i] > total_affected[i]:
                     total_recovered[i] = total_affected[i]
                     cumulative_extra_recovered = max(0, total_recovered[i] - aggregated_sol[i, 3])
