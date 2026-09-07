@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import folium
 import matplotlib.pyplot as plt
-from branca.element import Template, MacroElement
 from streamlit_folium import folium_static
 
 st.set_page_config(page_title="SWIRD Disaster Dashboard", layout="wide")
@@ -28,7 +27,7 @@ base_beta = st.sidebar.slider("Rainfall chance (beta)", 0.1, 1.0, 0.6)
 base_zeta = st.sidebar.slider("Drainage rate (zeta)", 0.1, 1.0, 0.3)
 
 st.sidebar.subheader("Resource Allocation")
-initial_resource = st.sidebar.number_input("Initial total resource sent (kg)", value=50000.0) # Increased default so it doesn't instantly deplete
+initial_resource = st.sidebar.number_input("Initial total resource sent (kg)", value=50000.0)
 conv_crit = st.sidebar.radio("Convergence criteria", ("Y", "N"))
 avg_consumption = st.sidebar.number_input("Avg consumption (kg/person)", value=0.2)
 
@@ -155,26 +154,19 @@ if st.button("Run Simulation"):
                         fill=True, fill_color='red', weight=2, popup=f"<b>RELIEF CENTER</b><br>{loc}"
                     ).add_to(m)
 
-            legend_html = '''
-            {% macro html(this, kwargs) %}
-            <div style="position: fixed; bottom: 50px; left: 50px; width: 170px; height: 180px; 
-                background-color: white; border:2px solid grey; z-index:9999; font-size:14px;
-                padding: 10px; border-radius: 5px; box-shadow: 2px 2px 6px rgba(0,0,0,0.3);">
-                <b>Compartments</b><br>
-                <i style="background:#3186cc; border-radius:50%; width:12px; height:12px; display:inline-block; margin-right:5px;"></i> Susceptible (S)<br>
-                <i style="background:#ffcc00; border-radius:50%; width:12px; height:12px; display:inline-block; margin-right:5px;"></i> Waterlogged (W)<br>
-                <i style="background:#ff6600; border-radius:50%; width:12px; height:12px; display:inline-block; margin-right:5px;"></i> Improving (I)<br>
-                <i style="background:#00008b; border-radius:50%; width:12px; height:12px; display:inline-block; margin-right:5px;"></i> Recovered (R)<br>
-                <i style="background:#ff0000; border-radius:50%; width:12px; height:12px; display:inline-block; margin-right:5px;"></i> Drowned (D)<br>
-                <i style="width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 10px solid red; display:inline-block; margin-right:5px;"></i> Relief Center
-            </div>
-            {% endmacro %}
-            '''
-            macro = MacroElement()
-            macro._template = Template(legend_html)
-            m.get_root().add_child(macro)
-            
             folium_static(m, width=600, height=500)
+            
+            # STREAMLIT NATIVE MAP LEGEND
+            st.markdown("""
+            <div style="display: flex; gap: 15px; flex-wrap: wrap; margin-top: 5px; padding: 10px; background-color: #f8f9fa; border-radius: 5px; border: 1px solid #e0e0e0;">
+                <div><i style="background:#3186cc; width:12px; height:12px; display:inline-block; border-radius:50%; margin-right:4px;"></i>Susceptible (S)</div>
+                <div><i style="background:#ffcc00; width:12px; height:12px; display:inline-block; border-radius:50%; margin-right:4px;"></i>Waterlogged (W)</div>
+                <div><i style="background:#ff6600; width:12px; height:12px; display:inline-block; border-radius:50%; margin-right:4px;"></i>Improving (I)</div>
+                <div><i style="background:#00008b; width:12px; height:12px; display:inline-block; border-radius:50%; margin-right:4px;"></i>Recovered (R)</div>
+                <div><i style="background:#ff0000; width:12px; height:12px; display:inline-block; border-radius:50%; margin-right:4px;"></i>Drowned (D)</div>
+                <div><i style="width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 12px solid red; display:inline-block; margin-right:4px;"></i>Relief Center</div>
+            </div>
+            """, unsafe_allow_html=True)
 
         with col2:
             st.subheader("Time-Series Population Dynamics")
@@ -193,7 +185,6 @@ if st.button("Run Simulation"):
                 
                 if conv_crit == 'Y':
                     if delta_affected > 0:
-                        # Normalize population to compute meaningful fractions
                         total_pop_t = max(aggregated_sol[i-1].sum(), 1.0)
                         W_t = aggregated_sol[i-1, 1] / total_pop_t
                         I_t = aggregated_sol[i-1, 2] / total_pop_t
@@ -201,39 +192,30 @@ if st.button("Run Simulation"):
                         denom = base_zeta * I_t - sigma_base * (1 - base_zeta) * W_t
                         if abs(denom) < 1e-8: denom = 1e-8 
                         
-                        # Apply DT scaling so the multiplier builds up accurately over time, scaled by distribution capacity N
                         ratio = min(abs(1.0 / denom), 1.0) * dt
-                        cap_factor = num_relief_centers / max(num_nodes, 1) # Distribution bandwidth
+                        cap_factor = num_relief_centers / max(num_nodes, 1) 
                         
                         added_resource = current_resource_pool * ratio * cap_factor
-                        current_resource_pool += added_resource # Continuous replenishment
+                        current_resource_pool += added_resource 
                         
                     boost = (num_relief_centers * added_resource) / max(avg_consumption, 1e-8)
                     cumulative_extra_recovered += boost
 
                 else: 
-                    # Criteria N: Depletion mechanic
                     if t <= 1.0:
                         gap = total_affected[i] - (aggregated_sol[i, 3] + cumulative_extra_recovered)
                         if gap > 0 and current_resource_pool > 0:
-                            # Formula: required resource to fulfill the gap
                             required_resource = (gap * max(avg_consumption, 1e-8)) / max(num_relief_centers, 1)
-                            
-                            # Limit extraction strictly to what is left in the pool
                             added_resource = min(required_resource, current_resource_pool)
-                            current_resource_pool -= added_resource # Drain the pool
+                            current_resource_pool -= added_resource 
                             
-                            # Apply the physical boost
                             boost = (num_relief_centers * added_resource) / max(avg_consumption, 1e-8)
                             cumulative_extra_recovered += boost
                     else:
-                        # If time > 1, no new resources allocated, effects exponentially decay and widening the gap
                         cumulative_extra_recovered *= 0.98 
 
-                # Sum the baseline recovery and the extra resource-induced recovery
                 total_recovered[i] = aggregated_sol[i, 3] + cumulative_extra_recovered
                 
-                # Strict structural cap constraint: Recovered <= Affected
                 if total_recovered[i] > total_affected[i]:
                     total_recovered[i] = total_affected[i]
                     cumulative_extra_recovered = max(0, total_recovered[i] - aggregated_sol[i, 3])
