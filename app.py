@@ -5,7 +5,7 @@ import folium
 import matplotlib.pyplot as plt
 from branca.element import Template, MacroElement
 from streamlit_folium import folium_static
-import pulp
+from scipy.optimize import differential_evolution
 import math
 
 st.set_page_config(page_title="SWIRD Disaster Dashboard", layout="wide")
@@ -46,19 +46,17 @@ def haversine(lat1, lon1, lat2, lon2):
 # ==========================================
 # 2. MAIN APP LOGIC
 # ==========================================
-st.title("SWIRD Disaster Impact & Integrated Resource Optimization")
-st.markdown("Simulating the ODE dynamics and executing an MILP for optimal resource distribution to minimize operating and penalty costs.")
+st.title("SWIRD Disaster Impact & Hybrid GA Optimization")
+st.markdown("Simulating ODE dynamics and running a Hybrid Genetic Algorithm + Local Search to optimize resource distribution.")
 
 if st.button("Run Simulation & Optimization"):
-    with st.spinner("Processing multi-nodal ODE simulation and solving MILP..."):
+    with st.spinner("Processing ODE simulation & running Hybrid Evolutionary Optimization..."):
         
-        # Time Constants
         T = 20
         dt = 0.01
         steps = int(T/dt)
         time_array = np.linspace(0, T, steps)
 
-        # Load Data
         excel_file = "Assam_90_Locations_Coordinates.xlsx"
         try:
             df = pd.read_excel(excel_file, sheet_name='90 Locations Dataset', header=3)
@@ -73,7 +71,6 @@ if st.button("Run Simulation & Optimization"):
         else:
             num_nodes = available_nodes
 
-        # Generate Distributions
         np.random.seed(42)
         S0_nodes = np.abs(np.random.normal(loc=base_S0, scale=base_S0*0.1, size=num_nodes))
         W0_nodes = np.abs(np.random.normal(loc=base_W0, scale=base_W0*0.2, size=num_nodes))
@@ -83,7 +80,6 @@ if st.button("Run Simulation & Optimization"):
         beta_nodes = np.clip(np.random.normal(loc=base_beta, scale=0.1, size=num_nodes), 0.1, 0.9)
         zeta_nodes = np.clip(np.random.normal(loc=base_zeta, scale=0.1, size=num_nodes), 0.1, 0.9)
 
-        # RK4 ODE Logic
         def swird_model_stable(y, beta, zeta):
             S, W, I, R, D = y
             C = W + I
@@ -102,7 +98,7 @@ if st.button("Run Simulation & Optimization"):
             return np.array([dS, dW, dI, dR, dD])
 
         aggregated_sol = np.zeros((steps, 5)) 
-        node_trajectories = [] # Save for MILP
+        node_trajectories = [] 
 
         for i in range(num_nodes):
             y = np.array([S0_nodes[i], W0_nodes[i], I0_nodes[i], R0_nodes[i], D0_nodes[i]])
@@ -125,25 +121,19 @@ if st.button("Run Simulation & Optimization"):
         df['Final_D'] = [sol[-1, 4] for sol in node_trajectories]
         df['Affected_Pop'] = df['Final_W'] + df['Final_I'] + df['Final_D']
 
-        # Relief Centers Identification
         df = df.sort_values(by='Affected_Pop', ascending=False).reset_index(drop=True)
         df['Is_Relief_Center'] = False
-        df.loc[:min(num_relief_centers, len(df))-1, 'Is_Relief_Center'] = True
+        N_camps = min(num_relief_centers, len(df))
+        df.loc[:N_camps-1, 'Is_Relief_Center'] = True
         
         camp_indices = df[df['Is_Relief_Center']].index.tolist()
         node_indices = df.index.tolist()
 
         # ==========================================
-        # MILP OPTIMIZATION (PuLP)
+        # HYBRID GA + LOCAL SEARCH OPTIMIZATION
         # ==========================================
-        Time = range(1, T + 1)
-        Camps = range(len(camp_indices))
-        Nodes = range(num_nodes)
-        Comps = ['S', 'W', 'I', 'D']
-        Comp_idx = {'S': 0, 'W': 1, 'I': 2, 'D': 4}
-        
-        # Distance Matrix 
-        dist_matrix = np.zeros((len(Camps), num_nodes))
+        T_macro = int(T)
+        dist_matrix = np.zeros((N_camps, num_nodes))
         for j, c_idx in enumerate(camp_indices):
             for i, n_idx in enumerate(node_indices):
                 dist_matrix[j, i] = haversine(
@@ -151,67 +141,128 @@ if st.button("Run Simulation & Optimization"):
                     df.loc[n_idx, 'Latitude (°N)'], df.loc[n_idx, 'Longitude (°E)']
                 )
                 
-        # MILP Parameters (Re-balanced so operation is economically viable vs penalties)
-        cost_open = 5000.0      # Lowered to encourage opening
-        cost_op = 1000.0        # Lowered to encourage operating
+        # Parameters
+        cost_open = 5000.0   
+        cost_op = 1000.0     
         cost_inv = 0.5          
-        trans_cost_rate = 0.05  # Realistic transport cost scaling
-        penalties = {'S': 50.0, 'W': 200.0, 'I': 500.0, 'D': 2000.0} # D highest, S lowest
+        trans_cost_rate = 0.05  
+        penalties = {'S': 50.0, 'W': 200.0, 'I': 500.0, 'D': 2000.0} 
+        camp_capacity = initial_resource / max(N_camps, 1)
+
+        # Pre-extract macro demands to speed up GA fitness evaluation
+        demands = np.zeros((T_macro, num_nodes, 4))
+        comp_map = {'S': 0, 'W': 1, 'I': 2, 'D': 4}
+        for t in range(T_macro):
+            step = int((t+1) / dt) - 1
+            for i, n_idx in enumerate(node_indices):
+                for comp_name, comp_idx in comp_map.items():
+                    demands[t, i, list(comp_map.keys()).index(comp_name)] = node_trajectories[n_idx][step, comp_idx] * avg_consumption
+
+        # GA Fitness Function (Chromosome = Flat array of supplies)
+        def fitness(supply_flat):
+            supply_matrix = supply_flat.reshape((N_camps, T_macro))
+            op_cost_total = 0.0
+            pen_cost_total = 0.0
+            
+            Inv = np.zeros(N_camps)
+            Opened = np.zeros(N_camps, dtype=bool)
+            
+            for t in range(T_macro):
+                # Available inventory at camps
+                Available = Inv + supply_matrix[:, t]
+                Available = np.clip(Available, 0, camp_capacity)
+                
+                # Operating decision
+                Operate_t = (Available > 1e-3)
+                Opened = np.logical_or(Opened, Operate_t)
+                
+                op_cost_total += np.sum(Operate_t) * cost_op
+                
+                # Greedy Local Flow Allocation (Prioritizing high penalty unmet demand)
+                for c_idx, comp in enumerate(['D', 'I', 'W', 'S']):
+                    pen_rate = penalties[comp]
+                    for i in range(num_nodes):
+                        demand = demands[t, i, c_idx]
+                        if demand <= 0: continue
+                        
+                        # Allocate from closest camps first
+                        closest_camps = np.argsort(dist_matrix[:, i])
+                        for j in closest_camps:
+                            if Available[j] > 0:
+                                alloc = min(demand, Available[j])
+                                Available[j] -= alloc
+                                demand -= alloc
+                                op_cost_total += alloc * dist_matrix[j, i] * trans_cost_rate
+                            if demand <= 1e-3:
+                                break
+                                
+                        if demand > 0:
+                            pen_cost_total += demand * pen_rate
+                
+                Inv = Available
+                op_cost_total += np.sum(Inv) * cost_inv
+                
+            total_cost = op_cost_total + pen_cost_total + np.sum(Opened) * cost_open
+            return total_cost
+
+        # Bounds for each GA gene: 0 to camp capacity
+        bounds = [(0.0, camp_capacity)] * (N_camps * T_macro)
         
-        camp_capacity = initial_resource / max(len(Camps), 1)
-        
-        prob = pulp.LpProblem("Relief_Resource_Allocation", pulp.LpMinimize)
-        
-        Open = pulp.LpVariable.dicts("Open", (Camps, Time), cat='Binary')
-        Operate = pulp.LpVariable.dicts("Operate", (Camps, Time), cat='Binary')
-        Inv = pulp.LpVariable.dicts("Inv", (Camps, Time), lowBound=0)
-        Supply = pulp.LpVariable.dicts("Supply", (Camps, Time), lowBound=0)
-        Flow = pulp.LpVariable.dicts("Flow", (Camps, Nodes, Time, Comps), lowBound=0)
-        Unmet = pulp.LpVariable.dicts("Unmet", (Nodes, Time, Comps), lowBound=0)
-        
-        prob += (
-            pulp.lpSum(cost_open * Open[j][t] for j in Camps for t in Time) +
-            pulp.lpSum(cost_op * Operate[j][t] for j in Camps for t in Time) +
-            pulp.lpSum(cost_inv * Inv[j][t] for j in Camps for t in Time) +
-            pulp.lpSum(trans_cost_rate * dist_matrix[j][i] * Flow[j][i][t][c] for j in Camps for i in Nodes for t in Time for c in Comps) +
-            pulp.lpSum(penalties[c] * Unmet[i][t][c] for i in Nodes for t in Time for c in Comps)
+        # SciPy Differential Evolution natively runs GA globally, then polishes with local pattern/gradient search
+        result = differential_evolution(
+            fitness, 
+            bounds, 
+            maxiter=30,     # Kept low for Streamlit speed
+            popsize=10, 
+            polish=True,    # Automatically applies Local Pattern/Gradient Search to the best GA result
+            seed=42
         )
         
-        for j in Camps:
-            prob += pulp.lpSum(Open[j][t] for t in Time) <= 1 
-            for t in Time:
-                prob += Operate[j][t] <= pulp.lpSum(Open[j][tau] for tau in range(1, t + 1))
-                
-                flow_out = pulp.lpSum(Flow[j][i][t][c] for i in Nodes for c in Comps)
-                if t == 1:
-                    prob += Inv[j][t] == Supply[j][t] - flow_out
-                else:
-                    prob += Inv[j][t] == Inv[j][t-1] + Supply[j][t] - flow_out
-                    
-                prob += Inv[j][t] <= camp_capacity * Operate[j][t]
-                prob += Supply[j][t] <= camp_capacity * Operate[j][t]
-                
-        for t in Time:
-            prob += pulp.lpSum(Supply[j][t] for j in Camps) <= initial_resource
-            
-            step = int(t / dt) - 1
-            for i, n_idx in enumerate(node_indices):
-                for c in Comps:
-                    pop_val = node_trajectories[n_idx][step, Comp_idx[c]]
-                    demand = pop_val * avg_consumption
-                    prob += pulp.lpSum(Flow[j][i][t][c] for j in Camps) + Unmet[i][t][c] == demand
-                    
-        prob.solve(pulp.PULP_CBC_CMD(msg=0))
-        
-        t_arr_milp = list(Time)
+        # -----------------------------------------------------
+        # RECONSTRUCT OPTIMAL HISTORY FOR PLOTTING
+        # -----------------------------------------------------
+        best_supply = result.x.reshape((N_camps, T_macro))
+        t_arr_milp = list(range(1, T_macro + 1))
         op_costs_history = []
         pen_costs_history = []
         
-        for t in Time:
-            op_cost = sum(cost_open * Open[j][t].varValue + cost_op * Operate[j][t].varValue + cost_inv * Inv[j][t].varValue for j in Camps)
-            pen_cost = sum(penalties[c] * Unmet[i][t][c].varValue for i in Nodes for c in Comps)
-            op_costs_history.append(op_cost)
-            pen_costs_history.append(pen_cost)
+        Inv = np.zeros(N_camps)
+        Opened = np.zeros(N_camps, dtype=bool)
+        
+        for t in range(T_macro):
+            step_op = 0.0
+            step_pen = 0.0
+            
+            Available = Inv + best_supply[:, t]
+            Available = np.clip(Available, 0, camp_capacity)
+            Operate_t = (Available > 1e-3)
+            new_opens = np.logical_and(Operate_t, ~Opened)
+            Opened = np.logical_or(Opened, Operate_t)
+            
+            step_op += np.sum(new_opens) * cost_open
+            step_op += np.sum(Operate_t) * cost_op
+            
+            for c_idx, comp in enumerate(['D', 'I', 'W', 'S']):
+                pen_rate = penalties[comp]
+                for i in range(num_nodes):
+                    demand = demands[t, i, c_idx]
+                    if demand <= 0: continue
+                    closest_camps = np.argsort(dist_matrix[:, i])
+                    for j in closest_camps:
+                        if Available[j] > 0:
+                            alloc = min(demand, Available[j])
+                            Available[j] -= alloc
+                            demand -= alloc
+                            step_op += alloc * dist_matrix[j, i] * trans_cost_rate
+                        if demand <= 1e-3: break
+                    if demand > 0:
+                        step_pen += demand * pen_rate
+            
+            Inv = Available
+            step_op += np.sum(Inv) * cost_inv
+            
+            op_costs_history.append(step_op)
+            pen_costs_history.append(step_pen)
 
 
         # ==========================================
@@ -333,9 +384,9 @@ if st.button("Run Simulation & Optimization"):
             st.pyplot(fig2)
             
             # ----------------------------------------
-            # PLOT 3: MILP OPTIMIZATION
+            # PLOT 3: GA+LOCAL SEARCH OPTIMIZATION
             # ----------------------------------------
-            st.subheader("MILP Cost Optimization Analysis")
+            st.subheader("Hybrid GA Optimization Cost Analysis")
             
             fig3, ax3 = plt.subplots(figsize=(8, 3.5))
             ax3.plot(t_arr_milp, op_costs_history, linewidth=2, color='green', marker='o', label='Total Operating Cost')
