@@ -6,3 +6,4 @@ matplotlib
 branca
 streamlit-folium
 openpyxl
+pulp
