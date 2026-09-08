@@ -142,7 +142,7 @@ if st.button("Run Simulation & Optimization"):
         Comps = ['S', 'W', 'I', 'D']
         Comp_idx = {'S': 0, 'W': 1, 'I': 2, 'D': 4}
         
-        # Distance Matrix (for Transport Costs)
+        # Distance Matrix 
         dist_matrix = np.zeros((len(Camps), num_nodes))
         for j, c_idx in enumerate(camp_indices):
             for i, n_idx in enumerate(node_indices):
@@ -151,19 +151,17 @@ if st.button("Run Simulation & Optimization"):
                     df.loc[n_idx, 'Latitude (°N)'], df.loc[n_idx, 'Longitude (°E)']
                 )
                 
-        # MILP Parameters
-        cost_open = 50000.0   
-        cost_op = 10000.0     
-        cost_inv = 2.0        
-        trans_cost_rate = 5.0 
-        penalties = {'S': 10.0, 'W': 100.0, 'I': 200.0, 'D': 1000.0} 
+        # MILP Parameters (Re-balanced so operation is economically viable vs penalties)
+        cost_open = 5000.0      # Lowered to encourage opening
+        cost_op = 1000.0        # Lowered to encourage operating
+        cost_inv = 0.5          
+        trans_cost_rate = 0.05  # Realistic transport cost scaling
+        penalties = {'S': 50.0, 'W': 200.0, 'I': 500.0, 'D': 2000.0} # D highest, S lowest
         
-        # Derived parameter: Capacity limit specifically linked to N
         camp_capacity = initial_resource / max(len(Camps), 1)
         
         prob = pulp.LpProblem("Relief_Resource_Allocation", pulp.LpMinimize)
         
-        # Decision Variables
         Open = pulp.LpVariable.dicts("Open", (Camps, Time), cat='Binary')
         Operate = pulp.LpVariable.dicts("Operate", (Camps, Time), cat='Binary')
         Inv = pulp.LpVariable.dicts("Inv", (Camps, Time), lowBound=0)
@@ -171,7 +169,6 @@ if st.button("Run Simulation & Optimization"):
         Flow = pulp.LpVariable.dicts("Flow", (Camps, Nodes, Time, Comps), lowBound=0)
         Unmet = pulp.LpVariable.dicts("Unmet", (Nodes, Time, Comps), lowBound=0)
         
-        # Objective Function
         prob += (
             pulp.lpSum(cost_open * Open[j][t] for j in Camps for t in Time) +
             pulp.lpSum(cost_op * Operate[j][t] for j in Camps for t in Time) +
@@ -180,29 +177,23 @@ if st.button("Run Simulation & Optimization"):
             pulp.lpSum(penalties[c] * Unmet[i][t][c] for i in Nodes for t in Time for c in Comps)
         )
         
-        # Constraints
         for j in Camps:
-            prob += pulp.lpSum(Open[j][t] for t in Time) <= 1 # Open camp at most once
+            prob += pulp.lpSum(Open[j][t] for t in Time) <= 1 
             for t in Time:
-                # Opening should be higher than/equal to operating
                 prob += Operate[j][t] <= pulp.lpSum(Open[j][tau] for tau in range(1, t + 1))
                 
-                # Inventory Constraint (Balance)
                 flow_out = pulp.lpSum(Flow[j][i][t][c] for i in Nodes for c in Comps)
                 if t == 1:
                     prob += Inv[j][t] == Supply[j][t] - flow_out
                 else:
                     prob += Inv[j][t] == Inv[j][t-1] + Supply[j][t] - flow_out
                     
-                # Capacity Constraint linked to N (Cannot hold or receive more than its fractional capacity)
                 prob += Inv[j][t] <= camp_capacity * Operate[j][t]
                 prob += Supply[j][t] <= camp_capacity * Operate[j][t]
                 
         for t in Time:
-            # Global Supply Capacity Constraint
             prob += pulp.lpSum(Supply[j][t] for j in Camps) <= initial_resource
             
-            # Supply Chain Balance & Unmet Demand
             step = int(t / dt) - 1
             for i, n_idx in enumerate(node_indices):
                 for c in Comps:
@@ -212,7 +203,6 @@ if st.button("Run Simulation & Optimization"):
                     
         prob.solve(pulp.PULP_CBC_CMD(msg=0))
         
-        # Extract MILP Costs for Plotting
         t_arr_milp = list(Time)
         op_costs_history = []
         pen_costs_history = []
@@ -265,12 +255,18 @@ if st.button("Run Simulation & Optimization"):
             """, unsafe_allow_html=True)
 
         with col2:
+            # ----------------------------------------
+            # PLOT 1: RECOVERY DYNAMICS
+            # ----------------------------------------
             st.subheader("Population Dynamics")
             total_recovered = aggregated_sol[:, 3].copy()
             total_affected = aggregated_sol[:, 1] + aggregated_sol[:, 2] + aggregated_sol[:, 4]
             sigma_base = 0.508 * base_beta - 0.112 * base_zeta
             current_resource_pool = initial_resource
             cumulative_extra_recovered = 0.0
+            
+            resource_pool_history = np.zeros(steps)
+            resource_pool_history[0] = initial_resource
 
             for i in range(1, steps):
                 delta_affected = total_affected[i] - total_affected[i-1]
@@ -303,6 +299,7 @@ if st.button("Run Simulation & Optimization"):
                     else:
                         cumulative_extra_recovered *= 0.98 
 
+                resource_pool_history[i] = current_resource_pool
                 total_recovered[i] = aggregated_sol[i, 3] + cumulative_extra_recovered
                 if total_recovered[i] > total_affected[i]:
                     total_recovered[i] = total_affected[i]
@@ -318,14 +315,33 @@ if st.button("Run Simulation & Optimization"):
             ax1.grid(True, linestyle='--', alpha=0.6)
             ax1.legend(loc='lower right')
             st.pyplot(fig1)
+
+            # ----------------------------------------
+            # PLOT 2: CAPACITY CONSTRAINT
+            # ----------------------------------------
+            st.subheader("Capacity Constraint Analysis")
             
-            st.subheader("MILP Cost Optimization Analysis")
+            max_accommodated = (resource_pool_history / max(avg_consumption, 1e-8)) * num_relief_centers
             
             fig2, ax2 = plt.subplots(figsize=(8, 3.5))
-            ax2.plot(t_arr_milp, op_costs_history, linewidth=2, color='green', marker='o', label='Total Operating Cost')
-            ax2.plot(t_arr_milp, pen_costs_history, linewidth=2, color='red', marker='x', label='Total Penalty Cost')
-            ax2.set_xlabel("Time Step (Discrete)")
-            ax2.set_ylabel("Cost ($)")
+            ax2.plot(time_array, max_accommodated, linewidth=2, color='green', linestyle='--', label='Max Accommodated Capacity')
+            ax2.plot(time_array, total_affected, linewidth=2, color='red', label='Affected Population')
+            ax2.set_xlabel("Time (t)")
+            ax2.set_ylabel("Population / Capacity")
             ax2.grid(True, linestyle='--', alpha=0.6)
             ax2.legend(loc='upper right')
             st.pyplot(fig2)
+            
+            # ----------------------------------------
+            # PLOT 3: MILP OPTIMIZATION
+            # ----------------------------------------
+            st.subheader("MILP Cost Optimization Analysis")
+            
+            fig3, ax3 = plt.subplots(figsize=(8, 3.5))
+            ax3.plot(t_arr_milp, op_costs_history, linewidth=2, color='green', marker='o', label='Total Operating Cost')
+            ax3.plot(t_arr_milp, pen_costs_history, linewidth=2, color='red', marker='x', label='Total Penalty Cost')
+            ax3.set_xlabel("Time Step (Discrete)")
+            ax3.set_ylabel("Cost ($)")
+            ax3.grid(True, linestyle='--', alpha=0.6)
+            ax3.legend(loc='upper right')
+            st.pyplot(fig3)
