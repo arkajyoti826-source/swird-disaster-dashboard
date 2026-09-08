@@ -5,6 +5,8 @@ import folium
 import matplotlib.pyplot as plt
 from branca.element import Template, MacroElement
 from streamlit_folium import folium_static
+import pulp
+import math
 
 st.set_page_config(page_title="SWIRD Disaster Dashboard", layout="wide")
 
@@ -32,15 +34,23 @@ initial_resource = st.sidebar.number_input("Initial total resource sent (kg)", v
 conv_crit = st.sidebar.radio("Convergence criteria", ("Y", "N"))
 avg_consumption = st.sidebar.number_input("Avg consumption (kg/person)", value=0.2)
 
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    a = math.sin((lat2-lat1)/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2-lon1)/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
 
 # ==========================================
 # 2. MAIN APP LOGIC
 # ==========================================
-st.title("SWIRD Disaster Impact & Recovery Dashboard")
-st.markdown("Simulating the dynamics of Susceptible, Waterlogged, Improving, Recovered, and Drowned populations across affected nodes in Assam.")
+st.title("SWIRD Disaster Impact & Integrated Resource Optimization")
+st.markdown("Simulating the ODE dynamics and executing an MILP for optimal resource distribution to minimize operating and penalty costs.")
 
-if st.button("Run Simulation"):
-    with st.spinner("Processing multi-nodal simulation..."):
+if st.button("Run Simulation & Optimization"):
+    with st.spinner("Processing multi-nodal ODE simulation and solving MILP..."):
         
         # Time Constants
         T = 20
@@ -70,7 +80,6 @@ if st.button("Run Simulation"):
         I0_nodes = np.abs(np.random.normal(loc=base_I0, scale=base_I0*0.2, size=num_nodes))
         R0_nodes = np.abs(np.random.normal(loc=base_R0, scale=base_R0*0.2, size=num_nodes))
         D0_nodes = np.abs(np.random.normal(loc=base_D0, scale=base_D0*0.2, size=num_nodes))
-
         beta_nodes = np.clip(np.random.normal(loc=base_beta, scale=0.1, size=num_nodes), 0.1, 0.9)
         zeta_nodes = np.clip(np.random.normal(loc=base_zeta, scale=0.1, size=num_nodes), 0.1, 0.9)
 
@@ -81,7 +90,6 @@ if st.button("Run Simulation"):
             N_pop = max(S + W + I + R + D, 1e-8)
             scale = 100.0 / N_pop 
             sigma_base = 0.508 * beta - 0.112 * zeta
-            
             beta_eff = beta
             sigma = 0.508 * beta_eff - 0.112 * zeta
             
@@ -94,7 +102,7 @@ if st.button("Run Simulation"):
             return np.array([dS, dW, dI, dR, dD])
 
         aggregated_sol = np.zeros((steps, 5)) 
-        final_S, final_W, final_I, final_R, final_D = [], [], [], [], []
+        node_trajectories = [] # Save for MILP
 
         for i in range(num_nodes):
             y = np.array([S0_nodes[i], W0_nodes[i], I0_nodes[i], R0_nodes[i], D0_nodes[i]])
@@ -107,24 +115,114 @@ if st.button("Run Simulation"):
                 k4 = dt * swird_model_stable(y + k3, beta_nodes[i], zeta_nodes[i])
                 y = np.clip(y + (k1 + 2*k2 + 2*k3 + k4) / 6, 0, None)
             
-            final_S.append(sol[-1, 0])
-            final_W.append(sol[-1, 1])
-            final_I.append(sol[-1, 2])
-            final_R.append(sol[-1, 3])
-            final_D.append(sol[-1, 4])
+            node_trajectories.append(sol)
             aggregated_sol += sol
 
-        df['Final_S'] = final_S
-        df['Final_W'] = final_W
-        df['Final_I'] = final_I
-        df['Final_R'] = final_R
-        df['Final_D'] = final_D
+        df['Final_S'] = [sol[-1, 0] for sol in node_trajectories]
+        df['Final_W'] = [sol[-1, 1] for sol in node_trajectories]
+        df['Final_I'] = [sol[-1, 2] for sol in node_trajectories]
+        df['Final_R'] = [sol[-1, 3] for sol in node_trajectories]
+        df['Final_D'] = [sol[-1, 4] for sol in node_trajectories]
         df['Affected_Pop'] = df['Final_W'] + df['Final_I'] + df['Final_D']
 
-        # Relief Centers
+        # Relief Centers Identification
         df = df.sort_values(by='Affected_Pop', ascending=False).reset_index(drop=True)
         df['Is_Relief_Center'] = False
         df.loc[:min(num_relief_centers, len(df))-1, 'Is_Relief_Center'] = True
+        
+        camp_indices = df[df['Is_Relief_Center']].index.tolist()
+        node_indices = df.index.tolist()
+
+        # ==========================================
+        # MILP OPTIMIZATION (PuLP)
+        # ==========================================
+        Time = range(1, T + 1)
+        Camps = range(len(camp_indices))
+        Nodes = range(num_nodes)
+        Comps = ['S', 'W', 'I', 'D']
+        Comp_idx = {'S': 0, 'W': 1, 'I': 2, 'D': 4}
+        
+        # Distance Matrix (for Transport Costs)
+        dist_matrix = np.zeros((len(Camps), num_nodes))
+        for j, c_idx in enumerate(camp_indices):
+            for i, n_idx in enumerate(node_indices):
+                dist_matrix[j, i] = haversine(
+                    df.loc[c_idx, 'Latitude (°N)'], df.loc[c_idx, 'Longitude (°E)'],
+                    df.loc[n_idx, 'Latitude (°N)'], df.loc[n_idx, 'Longitude (°E)']
+                )
+                
+        # MILP Parameters
+        cost_open = 50000.0   
+        cost_op = 10000.0     
+        cost_inv = 2.0        
+        trans_cost_rate = 5.0 
+        penalties = {'S': 10.0, 'W': 100.0, 'I': 200.0, 'D': 1000.0} 
+        
+        # Derived parameter: Capacity limit specifically linked to N
+        camp_capacity = initial_resource / max(len(Camps), 1)
+        
+        prob = pulp.LpProblem("Relief_Resource_Allocation", pulp.LpMinimize)
+        
+        # Decision Variables
+        Open = pulp.LpVariable.dicts("Open", (Camps, Time), cat='Binary')
+        Operate = pulp.LpVariable.dicts("Operate", (Camps, Time), cat='Binary')
+        Inv = pulp.LpVariable.dicts("Inv", (Camps, Time), lowBound=0)
+        Supply = pulp.LpVariable.dicts("Supply", (Camps, Time), lowBound=0)
+        Flow = pulp.LpVariable.dicts("Flow", (Camps, Nodes, Time, Comps), lowBound=0)
+        Unmet = pulp.LpVariable.dicts("Unmet", (Nodes, Time, Comps), lowBound=0)
+        
+        # Objective Function
+        prob += (
+            pulp.lpSum(cost_open * Open[j][t] for j in Camps for t in Time) +
+            pulp.lpSum(cost_op * Operate[j][t] for j in Camps for t in Time) +
+            pulp.lpSum(cost_inv * Inv[j][t] for j in Camps for t in Time) +
+            pulp.lpSum(trans_cost_rate * dist_matrix[j][i] * Flow[j][i][t][c] for j in Camps for i in Nodes for t in Time for c in Comps) +
+            pulp.lpSum(penalties[c] * Unmet[i][t][c] for i in Nodes for t in Time for c in Comps)
+        )
+        
+        # Constraints
+        for j in Camps:
+            prob += pulp.lpSum(Open[j][t] for t in Time) <= 1 # Open camp at most once
+            for t in Time:
+                # Opening should be higher than/equal to operating
+                prob += Operate[j][t] <= pulp.lpSum(Open[j][tau] for tau in range(1, t + 1))
+                
+                # Inventory Constraint (Balance)
+                flow_out = pulp.lpSum(Flow[j][i][t][c] for i in Nodes for c in Comps)
+                if t == 1:
+                    prob += Inv[j][t] == Supply[j][t] - flow_out
+                else:
+                    prob += Inv[j][t] == Inv[j][t-1] + Supply[j][t] - flow_out
+                    
+                # Capacity Constraint linked to N (Cannot hold or receive more than its fractional capacity)
+                prob += Inv[j][t] <= camp_capacity * Operate[j][t]
+                prob += Supply[j][t] <= camp_capacity * Operate[j][t]
+                
+        for t in Time:
+            # Global Supply Capacity Constraint
+            prob += pulp.lpSum(Supply[j][t] for j in Camps) <= initial_resource
+            
+            # Supply Chain Balance & Unmet Demand
+            step = int(t / dt) - 1
+            for i, n_idx in enumerate(node_indices):
+                for c in Comps:
+                    pop_val = node_trajectories[n_idx][step, Comp_idx[c]]
+                    demand = pop_val * avg_consumption
+                    prob += pulp.lpSum(Flow[j][i][t][c] for j in Camps) + Unmet[i][t][c] == demand
+                    
+        prob.solve(pulp.PULP_CBC_CMD(msg=0))
+        
+        # Extract MILP Costs for Plotting
+        t_arr_milp = list(Time)
+        op_costs_history = []
+        pen_costs_history = []
+        
+        for t in Time:
+            op_cost = sum(cost_open * Open[j][t].varValue + cost_op * Operate[j][t].varValue + cost_inv * Inv[j][t].varValue for j in Camps)
+            pen_cost = sum(penalties[c] * Unmet[i][t][c].varValue for i in Nodes for c in Comps)
+            op_costs_history.append(op_cost)
+            pen_costs_history.append(pen_cost)
+
 
         # ==========================================
         # 3. UI LAYOUT & VISUALIZATIONS
@@ -140,7 +238,6 @@ if st.button("Run Simulation"):
             for idx, row in df.iterrows():
                 lat, lon, loc = row['Latitude (°N)'], row['Longitude (°E)'], row['Location Name']
                 pops = {'S': row['Final_S'], 'W': row['Final_W'], 'I': row['Final_I'], 'R': row['Final_R'], 'D': row['Final_D']}
-                
                 for comp, val in sorted(pops.items(), key=lambda item: item[1], reverse=True):
                     if val > 0 and not np.isnan(val):
                         folium.CircleMarker(
@@ -148,16 +245,14 @@ if st.button("Run Simulation"):
                             fill=True, fill_color=colors[comp], fill_opacity=0.35, weight=1,
                             popup=f"<b>{loc}</b><br>{comp}: {val:,.0f}"
                         ).add_to(m)
-                        
                 if row['Is_Relief_Center']:
                     folium.RegularPolygonMarker(
                         location=[lat, lon], number_of_sides=3, radius=10, color='red',
                         fill=True, fill_color='red', weight=2, popup=f"<b>RELIEF CENTER</b><br>{loc}"
                     ).add_to(m)
 
-            folium_static(m, width=600, height=500)
+            folium_static(m, width=600, height=450)
             
-            # STREAMLIT NATIVE MAP LEGEND
             st.markdown("""
             <div style="display: flex; gap: 15px; flex-wrap: wrap; margin-top: 5px; padding: 10px; background-color: #f8f9fa; border-radius: 5px; border: 1px solid #e0e0e0;">
                 <div><i style="background:#3186cc; width:12px; height:12px; display:inline-block; border-radius:50%; margin-right:4px;"></i>Susceptible (S)</div>
@@ -171,17 +266,11 @@ if st.button("Run Simulation"):
 
         with col2:
             st.subheader("Population Dynamics")
-            
             total_recovered = aggregated_sol[:, 3].copy()
             total_affected = aggregated_sol[:, 1] + aggregated_sol[:, 2] + aggregated_sol[:, 4]
             sigma_base = 0.508 * base_beta - 0.112 * base_zeta
-            
             current_resource_pool = initial_resource
             cumulative_extra_recovered = 0.0
-            
-            # Array to track resource history for the second plot
-            resource_pool_history = np.zeros(steps)
-            resource_pool_history[0] = initial_resource
 
             for i in range(1, steps):
                 delta_affected = total_affected[i] - total_affected[i-1]
@@ -191,15 +280,11 @@ if st.button("Run Simulation"):
                 if conv_crit == 'Y':
                     if delta_affected > 0:
                         total_pop_t = max(aggregated_sol[i-1].sum(), 1.0)
-                        W_t = aggregated_sol[i-1, 1] / total_pop_t
-                        I_t = aggregated_sol[i-1, 2] / total_pop_t
-                        
+                        W_t, I_t = aggregated_sol[i-1, 1] / total_pop_t, aggregated_sol[i-1, 2] / total_pop_t
                         denom = base_zeta * I_t - sigma_base * (1 - base_zeta) * W_t
                         if abs(denom) < 1e-8: denom = 1e-8 
-                        
                         ratio = min(abs(1.0 / denom), 1.0) * dt
                         cap_factor = num_relief_centers / max(num_nodes, 1) 
-                        
                         added_resource = current_resource_pool * ratio * cap_factor
                         current_resource_pool += added_resource 
                         
@@ -213,45 +298,34 @@ if st.button("Run Simulation"):
                             required_resource = (gap * max(avg_consumption, 1e-8)) / max(num_relief_centers, 1)
                             added_resource = min(required_resource, current_resource_pool)
                             current_resource_pool -= added_resource 
-                            
                             boost = (num_relief_centers * added_resource) / max(avg_consumption, 1e-8)
                             cumulative_extra_recovered += boost
                     else:
                         cumulative_extra_recovered *= 0.98 
 
-                # Store the updated pool history
-                resource_pool_history[i] = current_resource_pool
-                
                 total_recovered[i] = aggregated_sol[i, 3] + cumulative_extra_recovered
-                
                 if total_recovered[i] > total_affected[i]:
                     total_recovered[i] = total_affected[i]
                     cumulative_extra_recovered = max(0, total_recovered[i] - aggregated_sol[i, 3])
 
-            # PLOT 1: Recovery Dynamics
-            fig1, ax1 = plt.subplots(figsize=(8, 4))
+            fig1, ax1 = plt.subplots(figsize=(8, 3.5))
             ax1.fill_between(time_array, total_recovered, total_affected, color='purple', alpha=0.1)
             ax1.fill_between(time_array, 0, total_recovered, color='blue', alpha=0.1)
             ax1.plot(time_array, total_recovered, linewidth=2, color='blue', label='Recovered Population')
-            ax1.plot(time_array, total_affected, linewidth=2, color='red', label='Affected Population (W+I+D)')
+            ax1.plot(time_array, total_affected, linewidth=2, color='red', label='Affected Population')
             ax1.set_xlabel("Time (t)")
             ax1.set_ylabel("Total Population")
-            ax1.set_title("Disaster Impact vs Recovery")
             ax1.grid(True, linestyle='--', alpha=0.6)
             ax1.legend(loc='lower right')
             st.pyplot(fig1)
             
-            # PLOT 2: Resource Capacity vs Affected
-            st.subheader("Capacity Constraint Analysis")
+            st.subheader("MILP Cost Optimization Analysis")
             
-            max_accommodated = (resource_pool_history / max(avg_consumption, 1e-8)) * num_relief_centers
-            
-            fig2, ax2 = plt.subplots(figsize=(8, 4))
-            ax2.plot(time_array, max_accommodated, linewidth=2, color='green', linestyle='--', label='Max Accommodated Capacity')
-            ax2.plot(time_array, total_affected, linewidth=2, color='red', label='Affected Population')
-            ax2.set_xlabel("Time (t)")
-            ax2.set_ylabel("Population / Capacity")
-            ax2.set_title("Available Resource Capacity vs Demand")
+            fig2, ax2 = plt.subplots(figsize=(8, 3.5))
+            ax2.plot(t_arr_milp, op_costs_history, linewidth=2, color='green', marker='o', label='Total Operating Cost')
+            ax2.plot(t_arr_milp, pen_costs_history, linewidth=2, color='red', marker='x', label='Total Penalty Cost')
+            ax2.set_xlabel("Time Step (Discrete)")
+            ax2.set_ylabel("Cost ($)")
             ax2.grid(True, linestyle='--', alpha=0.6)
             ax2.legend(loc='upper right')
             st.pyplot(fig2)
