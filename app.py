@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import folium
 import matplotlib.pyplot as plt
+from branca.element import Template, MacroElement
 from streamlit_folium import folium_static
 
 st.set_page_config(page_title="SWIRD Disaster Dashboard", layout="wide")
@@ -169,7 +170,7 @@ if st.button("Run Simulation"):
             """, unsafe_allow_html=True)
 
         with col2:
-            st.subheader("Time-Series Population Dynamics")
+            st.subheader("Population Dynamics")
             
             total_recovered = aggregated_sol[:, 3].copy()
             total_affected = aggregated_sol[:, 1] + aggregated_sol[:, 2] + aggregated_sol[:, 4]
@@ -177,6 +178,10 @@ if st.button("Run Simulation"):
             
             current_resource_pool = initial_resource
             cumulative_extra_recovered = 0.0
+            
+            # Array to track resource history for the second plot
+            resource_pool_history = np.zeros(steps)
+            resource_pool_history[0] = initial_resource
 
             for i in range(1, steps):
                 delta_affected = total_affected[i] - total_affected[i-1]
@@ -214,20 +219,39 @@ if st.button("Run Simulation"):
                     else:
                         cumulative_extra_recovered *= 0.98 
 
+                # Store the updated pool history
+                resource_pool_history[i] = current_resource_pool
+                
                 total_recovered[i] = aggregated_sol[i, 3] + cumulative_extra_recovered
                 
                 if total_recovered[i] > total_affected[i]:
                     total_recovered[i] = total_affected[i]
                     cumulative_extra_recovered = max(0, total_recovered[i] - aggregated_sol[i, 3])
 
-            fig, ax = plt.subplots(figsize=(8, 5))
-            ax.fill_between(time_array, total_recovered, total_affected, color='purple', alpha=0.1)
-            ax.fill_between(time_array, 0, total_recovered, color='blue', alpha=0.1)
-            ax.plot(time_array, total_recovered, linewidth=2, color='blue', label='Recovered Population')
-            ax.plot(time_array, total_affected, linewidth=2, color='red', label='Affected Population (W+I+D)')
-            ax.set_xlabel("Time (t)")
-            ax.set_ylabel("Total Population")
-            ax.grid(True, linestyle='--', alpha=0.6)
-            ax.legend(loc='lower right')
+            # PLOT 1: Recovery Dynamics
+            fig1, ax1 = plt.subplots(figsize=(8, 4))
+            ax1.fill_between(time_array, total_recovered, total_affected, color='purple', alpha=0.1)
+            ax1.fill_between(time_array, 0, total_recovered, color='blue', alpha=0.1)
+            ax1.plot(time_array, total_recovered, linewidth=2, color='blue', label='Recovered Population')
+            ax1.plot(time_array, total_affected, linewidth=2, color='red', label='Affected Population (W+I+D)')
+            ax1.set_xlabel("Time (t)")
+            ax1.set_ylabel("Total Population")
+            ax1.set_title("Disaster Impact vs Recovery")
+            ax1.grid(True, linestyle='--', alpha=0.6)
+            ax1.legend(loc='lower right')
+            st.pyplot(fig1)
             
-            st.pyplot(fig)
+            # PLOT 2: Resource Capacity vs Affected
+            st.subheader("Capacity Constraint Analysis")
+            
+            max_accommodated = (resource_pool_history / max(avg_consumption, 1e-8)) * num_relief_centers
+            
+            fig2, ax2 = plt.subplots(figsize=(8, 4))
+            ax2.plot(time_array, max_accommodated, linewidth=2, color='green', linestyle='--', label='Max Accommodated Capacity')
+            ax2.plot(time_array, total_affected, linewidth=2, color='red', label='Affected Population')
+            ax2.set_xlabel("Time (t)")
+            ax2.set_ylabel("Population / Capacity")
+            ax2.set_title("Available Resource Capacity vs Demand")
+            ax2.grid(True, linestyle='--', alpha=0.6)
+            ax2.legend(loc='upper right')
+            st.pyplot(fig2)
