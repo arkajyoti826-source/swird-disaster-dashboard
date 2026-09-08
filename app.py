@@ -47,7 +47,7 @@ def haversine(lat1, lon1, lat2, lon2):
 # 2. MAIN APP LOGIC
 # ==========================================
 st.title("SWIRD Disaster Impact & Hybrid GA Optimization")
-st.markdown("Simulating ODE dynamics and running a Hybrid Genetic Algorithm + Local Search to optimize resource distribution.")
+st.markdown("Simulating ODE dynamics and running a Hybrid Genetic Algorithm to optimize resource distribution.")
 
 if st.button("Run Simulation & Optimization"):
     with st.spinner("Processing ODE simulation & running Hybrid Evolutionary Optimization..."):
@@ -130,7 +130,7 @@ if st.button("Run Simulation & Optimization"):
         node_indices = df.index.tolist()
 
         # ==========================================
-        # HYBRID GA + LOCAL SEARCH OPTIMIZATION
+        # HYBRID GA OPTIMIZATION (MIRRORING MATLAB)
         # ==========================================
         T_macro = int(T)
         dist_matrix = np.zeros((N_camps, num_nodes))
@@ -149,7 +149,6 @@ if st.button("Run Simulation & Optimization"):
         penalties = {'S': 50.0, 'W': 200.0, 'I': 500.0, 'D': 2000.0} 
         camp_capacity = initial_resource / max(N_camps, 1)
 
-        # Pre-extract macro demands to speed up GA fitness evaluation
         demands = np.zeros((T_macro, num_nodes, 4))
         comp_map = {'S': 0, 'W': 1, 'I': 2, 'D': 4}
         for t in range(T_macro):
@@ -158,34 +157,43 @@ if st.button("Run Simulation & Optimization"):
                 for comp_name, comp_idx in comp_map.items():
                     demands[t, i, list(comp_map.keys()).index(comp_name)] = node_trajectories[n_idx][step, comp_idx] * avg_consumption
 
-        # GA Fitness Function (Chromosome = Flat array of supplies)
-        def fitness(supply_flat):
-            supply_matrix = supply_flat.reshape((N_camps, T_macro))
+        def fitness(chromosome):
+            # Parse GA chromosome into Open, Operate, and Supply variables
+            idx = 0
+            Open = np.round(chromosome[idx : idx + N_camps]).astype(bool)
+            idx += N_camps
+            
+            Operate_flat = np.round(chromosome[idx : idx + N_camps * T_macro]).astype(bool)
+            Operate = Operate_flat.reshape((N_camps, T_macro))
+            idx += N_camps * T_macro
+            
+            Supply = chromosome[idx : idx + N_camps * T_macro].reshape((N_camps, T_macro))
+            
             op_cost_total = 0.0
             pen_cost_total = 0.0
-            
+            constraint_pen = 0.0
             Inv = np.zeros(N_camps)
-            Opened = np.zeros(N_camps, dtype=bool)
+            
+            op_cost_total += np.sum(Open) * cost_open
             
             for t in range(T_macro):
-                # Available inventory at camps
-                Available = Inv + supply_matrix[:, t]
-                Available = np.clip(Available, 0, camp_capacity)
+                for j in range(N_camps):
+                    if Operate[j, t] and not Open[j]:
+                        constraint_pen += 1e7 # Penalty for operating a closed camp
+                    if Supply[j, t] > 0 and not Operate[j, t]:
+                        constraint_pen += 1e7 # Penalty for supplying a closed camp
+                        
+                Available = Inv + Supply[:, t] * Operate[:, t]
+                Available = np.clip(Available, 0, camp_capacity) 
                 
-                # Operating decision
-                Operate_t = (Available > 1e-3)
-                Opened = np.logical_or(Opened, Operate_t)
+                op_cost_total += np.sum(Operate[:, t]) * cost_op
                 
-                op_cost_total += np.sum(Operate_t) * cost_op
-                
-                # Greedy Local Flow Allocation (Prioritizing high penalty unmet demand)
                 for c_idx, comp in enumerate(['D', 'I', 'W', 'S']):
                     pen_rate = penalties[comp]
                     for i in range(num_nodes):
                         demand = demands[t, i, c_idx]
                         if demand <= 0: continue
                         
-                        # Allocate from closest camps first
                         closest_camps = np.argsort(dist_matrix[:, i])
                         for j in closest_camps:
                             if Available[j] > 0:
@@ -193,54 +201,51 @@ if st.button("Run Simulation & Optimization"):
                                 Available[j] -= alloc
                                 demand -= alloc
                                 op_cost_total += alloc * dist_matrix[j, i] * trans_cost_rate
-                            if demand <= 1e-3:
-                                break
+                            if demand <= 1e-3: break
                                 
                         if demand > 0:
                             pen_cost_total += demand * pen_rate
-                
+                            
                 Inv = Available
                 op_cost_total += np.sum(Inv) * cost_inv
                 
-            total_cost = op_cost_total + pen_cost_total + np.sum(Opened) * cost_open
-            return total_cost
+            return op_cost_total + pen_cost_total + constraint_pen
 
-        # Bounds for each GA gene: 0 to camp capacity
-        bounds = [(0.0, camp_capacity)] * (N_camps * T_macro)
+        # Variables: N Open bounds (0,1), N*T Operate bounds (0,1), N*T Supply bounds (0, cap)
+        bounds = [(0, 1)] * N_camps + [(0, 1)] * (N_camps * T_macro) + [(0, camp_capacity)] * (N_camps * T_macro)
         
-        # SciPy Differential Evolution natively runs GA globally, then polishes with local pattern/gradient search
+        # Run Derivative-Free Global Search
         result = differential_evolution(
-            fitness, 
-            bounds, 
-            maxiter=30,     # Kept low for Streamlit speed
-            popsize=10, 
-            polish=True,    # Automatically applies Local Pattern/Gradient Search to the best GA result
-            seed=42
+            fitness, bounds, maxiter=25, popsize=10, polish=False, seed=42
         )
         
         # -----------------------------------------------------
-        # RECONSTRUCT OPTIMAL HISTORY FOR PLOTTING
+        # EXTRACT OPTIMAL TRAJECTORIES FOR PLOTTING
         # -----------------------------------------------------
-        best_supply = result.x.reshape((N_camps, T_macro))
+        opt_x = result.x
+        idx = 0
+        best_Open = np.round(opt_x[idx : idx + N_camps]).astype(bool)
+        idx += N_camps
+        best_Operate = np.round(opt_x[idx : idx + N_camps * T_macro]).astype(bool).reshape((N_camps, T_macro))
+        idx += N_camps * T_macro
+        best_Supply = opt_x[idx : idx + N_camps * T_macro].reshape((N_camps, T_macro))
+        
         t_arr_milp = list(range(1, T_macro + 1))
         op_costs_history = []
         pen_costs_history = []
+        unmet_pop_history = [] # NEW: Tracking Unaccommodated Population
         
         Inv = np.zeros(N_camps)
-        Opened = np.zeros(N_camps, dtype=bool)
         
         for t in range(T_macro):
             step_op = 0.0
             step_pen = 0.0
+            step_unmet_pop = 0.0
             
-            Available = Inv + best_supply[:, t]
+            step_op += np.sum(best_Operate[:, t]) * cost_op
+            
+            Available = Inv + best_Supply[:, t] * best_Operate[:, t]
             Available = np.clip(Available, 0, camp_capacity)
-            Operate_t = (Available > 1e-3)
-            new_opens = np.logical_and(Operate_t, ~Opened)
-            Opened = np.logical_or(Opened, Operate_t)
-            
-            step_op += np.sum(new_opens) * cost_open
-            step_op += np.sum(Operate_t) * cost_op
             
             for c_idx, comp in enumerate(['D', 'I', 'W', 'S']):
                 pen_rate = penalties[comp]
@@ -257,12 +262,19 @@ if st.button("Run Simulation & Optimization"):
                         if demand <= 1e-3: break
                     if demand > 0:
                         step_pen += demand * pen_rate
+                        # Convert leftover demand kg back to raw population numbers
+                        step_unmet_pop += demand / avg_consumption 
             
             Inv = Available
             step_op += np.sum(Inv) * cost_inv
             
+            # For the first time step, add the opening costs
+            if t == 0:
+                step_op += np.sum(best_Open) * cost_open
+                
             op_costs_history.append(step_op)
             pen_costs_history.append(step_pen)
+            unmet_pop_history.append(step_unmet_pop)
 
 
         # ==========================================
@@ -304,6 +316,19 @@ if st.button("Run Simulation & Optimization"):
                 <div><i style="width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 12px solid red; display:inline-block; margin-right:4px;"></i>Relief Center</div>
             </div>
             """, unsafe_allow_html=True)
+            
+            # ----------------------------------------
+            # PLOT: UNACCOMMODATED POPULATION
+            # ----------------------------------------
+            st.subheader("Unaccommodated Population Over Time")
+            fig4, ax4 = plt.subplots(figsize=(8, 3.5))
+            ax4.fill_between(t_arr_milp, 0, unmet_pop_history, color='orange', alpha=0.3)
+            ax4.plot(t_arr_milp, unmet_pop_history, linewidth=2, color='darkorange', marker='s', label='Unaccommodated Population')
+            ax4.set_xlabel("Time Step (Discrete)")
+            ax4.set_ylabel("Population Size")
+            ax4.grid(True, linestyle='--', alpha=0.6)
+            ax4.legend(loc='upper right')
+            st.pyplot(fig4)
 
         with col2:
             # ----------------------------------------
@@ -371,9 +396,7 @@ if st.button("Run Simulation & Optimization"):
             # PLOT 2: CAPACITY CONSTRAINT
             # ----------------------------------------
             st.subheader("Capacity Constraint Analysis")
-            
             max_accommodated = (resource_pool_history / max(avg_consumption, 1e-8)) * num_relief_centers
-            
             fig2, ax2 = plt.subplots(figsize=(8, 3.5))
             ax2.plot(time_array, max_accommodated, linewidth=2, color='green', linestyle='--', label='Max Accommodated Capacity')
             ax2.plot(time_array, total_affected, linewidth=2, color='red', label='Affected Population')
@@ -384,10 +407,9 @@ if st.button("Run Simulation & Optimization"):
             st.pyplot(fig2)
             
             # ----------------------------------------
-            # PLOT 3: GA+LOCAL SEARCH OPTIMIZATION
+            # PLOT 3: GA COST OPTIMIZATION
             # ----------------------------------------
-            st.subheader("Hybrid GA Optimization Cost Analysis")
-            
+            st.subheader("Hybrid GA Cost Optimization Analysis")
             fig3, ax3 = plt.subplots(figsize=(8, 3.5))
             ax3.plot(t_arr_milp, op_costs_history, linewidth=2, color='green', marker='o', label='Total Operating Cost')
             ax3.plot(t_arr_milp, pen_costs_history, linewidth=2, color='red', marker='x', label='Total Penalty Cost')
