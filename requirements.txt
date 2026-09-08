@@ -7,3 +7,4 @@ branca
 streamlit-folium
 openpyxl
 pulp
+scipy
